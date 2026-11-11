@@ -14,7 +14,7 @@ MODALIDADES = {
 
 REGEX_FILTRO = re.compile(
     r"\b("
-    r"geotecnia|geot[eé]cnico|hidrogeologia|hidrogeol[oó]gico|geof[ií]sica|geof[ií]sico|"
+    r"geologia|ge[oó]logo|geol[oó]gic[oa]s?|geotecnia|geot[eé]cnico|hidrogeologia|hidrogeol[oó]gico|geof[ií]sica|geof[ií]sico|"
     r"poço\s+artesiano|poços\s+artesianos|perfura[cç][aã]o\s+de\s+poço|poço\s+de\s+monitoramento|"
     r"sondagem\s+(a\s+trado|rotativa|spt|mista|percuss[aã]o)|"
     r"estabilidade\s+de\s+talude|conten[cç][aã]o\s+de\s+encosta|mapeamento\s+geol[oó]gico|"
@@ -72,14 +72,15 @@ def enviar_alerta_telegram(mensagem):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": mensagem,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"[!] Erro na resposta do Telegram: {response.text}")
+            print(f"[!] Erro ao enviar para o Telegram. Resposta da API: {response.text}")
     except Exception as e:
-        print(f"[!] Erro de conexão com o Telegram: {e}")
+        print(f"[!] Falha ao disparar mensagem para o Telegram: {e}")
 
 def processar_oportunidades():
     data_alvo = datetime.now().strftime("%Y%m%d")
@@ -88,7 +89,6 @@ def processar_oportunidades():
     pagina = 1
     total_novos = 0
 
-    # Cabeçalho simulando navegador para evitar bloqueio 404/403/limites de requisição
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -121,7 +121,6 @@ def processar_oportunidades():
                         if licitacao_ja_existe(id_pncp):
                             continue
 
-                        # Tratamento seguro contra dicionários/chaves nulas (NoneType)
                         orgao_entidade = item.get("orgaoEntidade")
                         orgao = orgao_entidade.get("razaoSocial", "Órgão Não Identificado") if isinstance(orgao_entidade, dict) else "Órgão Não Identificado"
 
@@ -133,11 +132,11 @@ def processar_oportunidades():
                             f"🚨 <b>NOVA OPORTUNIDADE ENCONTRADA!</b>\n\n"
                             f"🏛 <b>Órgão:</b> {orgao}\n"
                             f"🛠 <b>Modalidade:</b> {nome_modalidade}\n"
-                            f"💰 <b>Valor:</b> R$ {valor_estimado:,.2f}\n\n"
+                            f"💰 <b>Valor Estimado:</b> R$ {valor_estimado:,.2f}\n\n"
                             f"📝 <b>Objeto:</b>\n{objeto}\n\n"
-                            f"🔗 <a href='{link_edital}'>Acesse o Edital</a>"
+                            f"🔗 <a href='{link_edital}'>Clique aqui para acessar o Edital</a>"
                         )
-                        print(f"[+] Notificando oportunidade: {id_pncp}")
+                        print(f"[+] Notificando oportunidade: {id_pncp} - {orgao}")
                         enviar_alerta_telegram(msg_alerta)
                         salvar_licitacao(id_pncp, orgao, objeto, valor_estimado, link_edital)
                         total_novos += 1
