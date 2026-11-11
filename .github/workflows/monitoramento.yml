@@ -1,0 +1,25 @@
+name: Execucao Diaria do Monitor de Licitacoes
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout do código
+      uses: actions/checkout@v3
+    - name: Configurar o Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: Instalar dependências
+      run: |
+        pip install requests
+    - name: Executar Script de Monitoramento
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python main.py
