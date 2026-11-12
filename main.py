@@ -1,281 +1,249 @@
+"""
+Monitor de licitações de Geociências no PNCP com alertas no Telegram.
+
+Funciona no GitHub Actions (variáveis de ambiente) e no Google Colab (userdata).
+"""
 import html
-import logging
 import os
 import re
 import sqlite3
+import sys
 import time
-import unicodedata
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import requests
 
 API_BASE_URL = "https://pncp.gov.br/api/consulta"
-ENDPOINT = f"{API_BASE_URL}/v1/contratacoes/proposta"
 DB_NAME = os.getenv("DB_NAME", "licitacoes_geociencias.db")
-BR_TZ = ZoneInfo("America/Sao_Paulo")
-PAGE_SIZE = 50
-MAX_PAGES = int(os.getenv("MAX_PAGES", "500"))
-DIAS_A_FRENTE = int(os.getenv("DIAS_A_FRENTE", "30"))
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Janela de busca: contratações com recebimento de propostas aberto até N dias à frente
+DIAS_A_FRENTE = int(os.getenv("DIAS_A_FRENTE", "60"))
+TAMANHO_PAGINA = 50          # máximo aceito pelo endpoint /proposta
+MAX_PAGINAS = int(os.getenv("MAX_PAGINAS", "400"))
+# Limite de alertas por execução (evita "enxurrada" na 1ª execução; o restante vai no dia seguinte)
+MAX_ALERTAS = int(os.getenv("MAX_ALERTAS", "80"))
 
-MODALIDADES = {
-    1: "Leilão",
-    2: "Concorrência",
-    3: "Concurso",
-    4: "Pregão",
-    5: "Diálogo Competitivo",
-    6: "Dispensa de Licitação",
-    7: "Inexigibilidade",
-}
-
-# A normalização remove diferenças entre caracteres acentuados e não acentuados.
-TERMOS = (
-    "geologia", "geologo", "geologica", "geologicas", "geologico", "geologicos",
-    "geotecnia", "geotecnico", "geotecnica", "hidrogeologia", "hidrogeologico",
-    "geofisica", "geofisico", "poco artesiano", "pocos artesianos",
-    "perfuracao de poco", "poco de monitoramento", "sondagem a trado",
-    "sondagem rotativa", "sondagem spt", "sondagem mista", "sondagem percussao",
-    "estabilidade de talude", "contencao de encosta", "mapeamento geologico",
-    "ensaio de solo", "mecanica dos solos", "outorga de agua",
-    "rebaixamento de lencol", "topografia", "topografico",
-    "georreferenciamento", "georreferenciado", "aerofotogrametria",
-    "meio ambiente", "ambiental", "licenciamento ambiental",
-    "estudo de impacto", "eia rima", "recuperacao de area degradada",
-    "prad", "barragem", "barragens", "recursos hidricos",
-    "aguas subterraneas", "teste de bombeamento",
-)
-TERMOS_REGEX = re.compile(
-    r"\b(?:" + "|".join(re.escape(t) for t in TERMOS) + r")\b",
+REGEX_FILTRO = re.compile(
+    r"\b("
+    r"geologia|ge[oó]logos?|geol[oó]gic[oa]s?|geotecnia|geot[eé]cnic[oa]s?|"
+    r"hidrogeologia|hidrogeol[oó]gic[oa]s?|geof[ií]sica|geof[ií]sic[oa]s?|"
+    r"po[cç]os?\s+artesianos?|perfura[cç][aã]o\s+de\s+po[cç]os?|po[cç]os?\s+de\s+monitoramento|"
+    r"sondage(m|ns)\s+(a\s+trado|rotativas?|spt|mistas?|(a|à|de)\s+percuss[aã]o|percuss[aã]o)|"
+    r"estabilidade\s+de\s+taludes?|conten[cç][aã]o\s+de\s+encostas?|mapeamento\s+geol[oó]gico|"
+    r"ensaios?\s+de\s+solos?|mec[aâ]nica\s+dos\s+solos|outorga\s+de\s+(uso\s+de\s+)?[aá]gua|"
+    r"rebaixamento\s+de\s+len[cç]ol|"
+    r"topografia|topogr[aá]fic[oa]s?|georreferenciamento|georreferenciad[oa]s?|aerofotogrametria|"
+    r"meio\s+ambiente|ambiental|licenciamento\s+ambiental|estudo\s+de\s+impacto|eia[\s/-]*rima|"
+    r"recupera[cç][aã]o\s+de\s+[aá]reas?\s+degradadas?|prad|barragem|barragens|"
+    r"recursos\s+h[ií]dricos|[aá]guas\s+subterr[aâ]neas|testes?\s+de\s+bombeamento"
+    r")\b",
     re.IGNORECASE,
 )
 
 
-def normalizar(texto):
-    texto = unicodedata.normalize("NFKD", str(texto or ""))
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    return re.sub(r"\s+", " ", texto).strip().lower()
+# ---------------------------------------------------------------- credenciais
+def carregar_credenciais():
+    """Tenta o Colab (userdata); se não estiver no Colab, usa variáveis de ambiente."""
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not (token and chat_id):
+        try:
+            from google.colab import userdata  # só existe no Colab
+            token = token or userdata.get("TELEGRAM_TOKEN")
+            chat_id = chat_id or userdata.get("TELEGRAM_CHAT_ID")
+        except Exception:
+            pass
+    return (token or "").strip(), str(chat_id or "").strip()
 
 
-def objeto_relevante(objeto):
-    return bool(TERMOS_REGEX.search(normalizar(objeto)))
+TELEGRAM_TOKEN, TELEGRAM_CHAT_ID = carregar_credenciais()
 
 
+# ---------------------------------------------------------------- banco
 def inicializar_banco():
-    with sqlite3.connect(DB_NAME, timeout=30) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licitacoes (
-                id_pncp TEXT PRIMARY KEY,
-                orgao TEXT NOT NULL,
-                objeto TEXT NOT NULL,
-                valor REAL,
-                link TEXT,
-                data_descoberta TEXT NOT NULL
-            )
-        """)
-        conn.commit()
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS licitacoes ("
+            "id_pncp TEXT PRIMARY KEY, orgao TEXT, objeto TEXT, valor REAL, "
+            "link TEXT, data_descoberta TEXT)"
+        )
 
 
 def licitacao_ja_existe(id_pncp):
-    with sqlite3.connect(DB_NAME, timeout=30) as conn:
+    with sqlite3.connect(DB_NAME) as conn:
         return conn.execute(
             "SELECT 1 FROM licitacoes WHERE id_pncp = ?", (id_pncp,)
         ).fetchone() is not None
 
 
 def salvar_licitacao(id_pncp, orgao, objeto, valor, link):
-    with sqlite3.connect(DB_NAME, timeout=30) as conn:
+    with sqlite3.connect(DB_NAME) as conn:
         conn.execute(
-            """INSERT OR IGNORE INTO licitacoes
-               (id_pncp, orgao, objeto, valor, link, data_descoberta)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (id_pncp, orgao, objeto, valor, link,
-             datetime.now(BR_TZ).isoformat()),
+            "INSERT OR IGNORE INTO licitacoes VALUES (?, ?, ?, ?, ?, ?)",
+            (id_pncp, orgao, objeto, valor, link, datetime.now().isoformat()),
         )
-        conn.commit()
 
 
-def obter_id(item):
-    # numeroControlePNCP é o identificador mais apropriado quando fornecido.
-    numero = item.get("numeroControlePNCP")
-    if numero:
-        return str(numero)
-
-    cnpj = item.get("cnpjOrgao") or item.get("orgaoEntidade", {}).get("cnpj")
-    ano = item.get("anoCompra")
-    sequencial = item.get("sequencialCompra")
-    if cnpj and ano is not None and sequencial is not None:
-        return f"{cnpj}-{ano}-{sequencial}"
-
-    raise ValueError("Registro PNCP sem identificador suficiente para deduplicação")
-
-
-def montar_link(item):
-    link = item.get("linkSistemaOrigem") or item.get("urlItemControle")
-    if link and str(link).startswith(("https://", "http://")):
-        return str(link)
-
-    numero = item.get("numeroControlePNCP")
-    if numero:
-        return f"https://pncp.gov.br/app/editais/{numero}"
-
-    cnpj = item.get("cnpjOrgao") or item.get("orgaoEntidade", {}).get("cnpj")
-    ano = item.get("anoCompra")
-    sequencial = item.get("sequencialCompra")
-    if cnpj and ano is not None and sequencial is not None:
-        return f"https://pncp.gov.br/app/editais/{cnpj}/{ano}/{sequencial}"
-    return "https://pncp.gov.br/"
-
-
-def enviar_alerta(mensagem, session=requests):
+# ---------------------------------------------------------------- telegram
+def enviar_alerta(mensagem):
+    """Envia mensagem ao Telegram. Retorna True só se o Telegram confirmou o envio."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN e/ou TELEGRAM_CHAT_ID não configurados. "
-            "Cadastre ambos como variáveis de ambiente/Secrets."
-        )
-
+        print("[!] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID não configurados.")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    response = session.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": mensagem,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram recusou a mensagem: {payload}")
-    return payload
-
-
-def formatar_mensagem(item):
-    orgao_obj = item.get("orgaoEntidade") or {}
-    orgao = orgao_obj.get("razaoSocial") or item.get("nomeOrgao") or "Órgão não identificado"
-    objeto = item.get("objeto") or item.get("objetoCompra") or "Objeto não informado"
-    valor = item.get("valorTotalEstimado")
-    try:
-        valor_txt = f"R$ {float(valor or 0):,.2f}"
-    except (TypeError, ValueError):
-        valor_txt = "Não informado"
-    modalidade_codigo = item.get("codigoModalidadeContratacao")
-    modalidade = MODALIDADES.get(modalidade_codigo, f"Código {modalidade_codigo or 'não informado'}")
-    link = montar_link(item)
-
-    # Escapar conteúdo dinâmico para não quebrar o HTML do Telegram.
-    return (
-        "🚨 <b>OPORTUNIDADE GEOCIÊNCIAS</b>\n\n"
-        f"🏛 <b>Órgão:</b> {html.escape(str(orgao))}\n"
-        f"🛠 <b>Modalidade:</b> {html.escape(modalidade)}\n"
-        f"💰 <b>Valor estimado:</b> {html.escape(valor_txt)}\n"
-        f"📝 <b>Objeto:</b>\n{html.escape(str(objeto))[:2500]}\n"
-        f'🔗 <a href="{html.escape(link, quote=True)}">Acesse a contratação no PNCP</a>'
-    )
-
-
-def consultar_pagina(session, data_final, pagina):
-    params = {
-        "dataFinal": data_final,
-        "pagina": pagina,
-        "tamanhoPagina": PAGE_SIZE,
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensagem,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
-    response = session.get(
-        ENDPOINT,
-        params=params,
-        headers={"Accept": "application/json", "User-Agent": "GeoIntelBrasil-Monitor/1.0"},
-        timeout=(10, 45),
+    for tentativa in range(4):
+        try:
+            r = requests.post(url, json=payload, timeout=20)
+            if r.status_code == 200 and r.json().get("ok"):
+                time.sleep(1.1)  # respeita o limite de ~1 msg/s por chat
+                return True
+            if r.status_code == 429:
+                espera = r.json().get("parameters", {}).get("retry_after", 5)
+                print(f"[!] Telegram limitou envios; aguardando {espera}s")
+                time.sleep(espera + 1)
+                continue
+            print(f"[!] Telegram respondeu {r.status_code}: {r.text[:300]}")
+            if r.status_code in (400, 401, 403, 404):
+                return False  # token/chat inválido ou mensagem malformada: não adianta repetir
+        except requests.RequestException as e:
+            print(f"[!] Erro envio Telegram (tentativa {tentativa + 1}): {e}")
+        time.sleep(3)
+    return False
+
+
+# ---------------------------------------------------------------- formatação
+def formatar_moeda(valor):
+    try:
+        v = float(valor or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v <= 0:
+        return "Não informado / sigiloso"
+    return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def formatar_data(iso):
+    if not iso:
+        return "—"
+    try:
+        return datetime.fromisoformat(iso[:19]).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return iso
+
+
+def montar_mensagem(item, link):
+    esc = lambda s: html.escape(str(s or ""), quote=True)
+    orgao = (item.get("orgaoEntidade") or {}).get("razaoSocial") or "Órgão Não Identificado"
+    unidade = item.get("unidadeOrgao") or {}
+    local = " / ".join(x for x in (unidade.get("municipioNome"), unidade.get("ufSigla")) if x) or "—"
+    objeto = (item.get("objetoCompra") or "").strip()
+    if len(objeto) > 2500:
+        objeto = objeto[:2500] + "…"
+    return (
+        "🚨 <b>OPORTUNIDADE GEOCIÊNCIAS!</b>\n\n"
+        f"🏛 <b>Órgão:</b> {esc(orgao)}\n"
+        f"📍 <b>Local:</b> {esc(local)}\n"
+        f"🛠 <b>Modalidade:</b> {esc(item.get('modalidadeNome') or 'Outros')}\n"
+        f"💰 <b>Valor estimado:</b> {esc(formatar_moeda(item.get('valorTotalEstimado')))}\n"
+        f"⏰ <b>Propostas até:</b> {esc(formatar_data(item.get('dataEncerramentoProposta')))}\n"
+        f"📝 <b>Objeto:</b>\n{esc(objeto)}\n\n"
+        f"🔗 <a href=\"{esc(link)}\">Acesse o Edital no PNCP</a>"
     )
-    if response.status_code == 204:
-        return {"data": [], "totalPaginas": pagina}
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("Resposta inesperada da API PNCP: JSON não é objeto")
-    if "data" not in payload or not isinstance(payload["data"], list):
-        raise ValueError(f"Resposta PNCP sem lista 'data': {payload}")
-    return payload
 
 
-def processar_oportunidades(session=requests):
+# ---------------------------------------------------------------- PNCP
+def buscar_pagina(pagina, data_final):
+    """Retorna o JSON de uma página (dict) ou None se não houver dados."""
+    endpoint = f"{API_BASE_URL}/v1/contratacoes/proposta"
+    params = {"dataFinal": data_final, "pagina": pagina, "tamanhoPagina": TAMANHO_PAGINA}
+    headers = {"User-Agent": "monitor-licitacoes-geociencias/2.0", "Accept": "application/json"}
+    for tentativa in range(5):
+        try:
+            r = requests.get(endpoint, params=params, headers=headers, timeout=60)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 204:
+                return None
+            print(f"[!] PNCP página {pagina}: HTTP {r.status_code} {r.text[:200]}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"[!] PNCP página {pagina} (tentativa {tentativa + 1}): {e}")
+        time.sleep(2 ** tentativa * 2)  # 2, 4, 8, 16, 32 s
+    raise RuntimeError(f"PNCP não respondeu na página {pagina} após 5 tentativas")
+
+
+def processar_oportunidades():
     inicializar_banco()
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Configure TELEGRAM_TOKEN e TELEGRAM_CHAT_ID antes de executar.")
+    data_final = (datetime.now() + timedelta(days=DIAS_A_FRENTE)).strftime("%Y%m%d")
+    print(f"[*] Varrendo contratações com propostas abertas no PNCP (dataFinal={data_final})...")
 
-    hoje = datetime.now(BR_TZ).date()
-    data_final = (hoje + timedelta(days=DIAS_A_FRENTE)).strftime("%Y%m%d")
-    logging.info("Consultando propostas abertas no PNCP até %s", data_final)
+    analisados = encontrados = enviados = falhas = 0
+    pagina, total_paginas = 1, 1
+    erro_pncp = None
 
-    total_lidos = 0
-    total_relevantes = 0
-    total_enviados = 0
-    pagina = 1
-
-    while pagina <= MAX_PAGES:
-        payload = None
-        for tentativa in range(1, 4):
-            try:
-                payload = consultar_pagina(session, data_final, pagina)
-                break
-            except (requests.RequestException, ValueError) as exc:
-                logging.warning("Falha PNCP página %s, tentativa %s/3: %s",
-                                pagina, tentativa, exc)
-                if tentativa == 3:
-                    raise
-                time.sleep(2 ** tentativa)
-
-        itens = payload["data"]
-        if not itens:
+    while pagina <= total_paginas and pagina <= MAX_PAGINAS:
+        try:
+            dados = buscar_pagina(pagina, data_final)
+        except RuntimeError as e:
+            erro_pncp = str(e)
+            print(f"[!] {e}")
             break
+        if not dados:
+            break
+        total_paginas = int(dados.get("totalPaginas") or 1)
+        itens = dados.get("data") or []
+        print(f"[*] Página {pagina}/{total_paginas}: {len(itens)} itens")
 
-        total_lidos += len(itens)
         for item in itens:
-            objeto = item.get("objeto") or item.get("objetoCompra") or ""
-            if not objeto_relevante(objeto):
+            analisados += 1
+            objeto = item.get("objetoCompra") or ""
+            if not REGEX_FILTRO.search(objeto):
                 continue
 
-            total_relevantes += 1
-            id_pncp = obter_id(item)
+            org = item.get("orgaoEntidade") or {}
+            cnpj = org.get("cnpj") or "00000000000000"
+            ano = item.get("anoCompra") or datetime.now().year
+            seq = item.get("sequencialCompra") or 0
+            id_pncp = item.get("numeroControlePNCP") or f"{cnpj}-{ano}-{seq}"
             if licitacao_ja_existe(id_pncp):
                 continue
+            encontrados += 1
+            if enviados >= MAX_ALERTAS:
+                continue  # fica para a próxima execução (não é salvo no banco)
 
-            mensagem = formatar_mensagem(item)
-            # Só registra no banco depois da confirmação positiva do Telegram.
-            enviar_alerta(mensagem, session=session)
-            orgao = (item.get("orgaoEntidade") or {}).get("razaoSocial", "Órgão não identificado")
-            try:
-                valor = float(item.get("valorTotalEstimado") or 0)
-            except (TypeError, ValueError):
-                valor = None
-            salvar_licitacao(id_pncp, orgao, objeto, valor, montar_link(item))
-            total_enviados += 1
-            logging.info("Alerta enviado: %s | %s", orgao, id_pncp)
-
-        total_paginas = payload.get("totalPaginas")
-        if total_paginas is not None and pagina >= int(total_paginas):
-            break
-        if len(itens) < PAGE_SIZE:
-            break
+            link = f"https://pncp.gov.br/app/editais/{cnpj}/{ano}/{seq}"
+            orgao = org.get("razaoSocial") or "Órgão Não Identificado"
+            print(f"[+] Enviando alerta: {orgao} | {objeto[:80]}")
+            if enviar_alerta(montar_mensagem(item, link)):
+                enviados += 1
+                salvar_licitacao(id_pncp, orgao, objeto, item.get("valorTotalEstimado") or 0.0, link)
+            else:
+                falhas += 1
+                if falhas >= 3 and enviados == 0:
+                    print("[!] Telegram falhou 3 vezes seguidas. Verifique TOKEN e CHAT_ID.")
+                    return 1
         pagina += 1
 
-    logging.info(
-        "Concluído: %s registros lidos, %s relevantes, %s alertas enviados.",
-        total_lidos, total_relevantes, total_enviados,
+    pendentes = encontrados - enviados
+    resumo = (
+        f"📊 <b>Varredura PNCP concluída</b> ({datetime.now():%d/%m/%Y %H:%M})\n"
+        f"Licitações analisadas: {analisados}\n"
+        f"Novas oportunidades enviadas: {enviados}"
+        + (f"\nPendentes para a próxima execução: {pendentes}" if pendentes > 0 else "")
+        + (f"\n⚠️ Varredura incompleta: {html.escape(erro_pncp)}" if erro_pncp else "")
     )
-    return {
-        "lidos": total_lidos,
-        "relevantes": total_relevantes,
-        "enviados": total_enviados,
-    }
+    print(resumo.replace("<b>", "").replace("</b>", ""))
+    enviar_alerta(resumo)
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return 1
+    return 1 if (erro_pncp and analisados == 0) else 0
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    processar_oportunidades()
+    sys.exit(processar_oportunidades())
