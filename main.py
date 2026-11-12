@@ -1,7 +1,8 @@
 import os
 import re
 import sqlite3
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 import requests
 
 API_BASE_URL = "https://pncp.gov.br/api/consulta"
@@ -12,6 +13,7 @@ MODALIDADES = {
     5: "Diálogo Competitivo", 6: "Dispensa de Licitação", 7: "Inexigibilidade"
 }
 
+# Filtro consolidado de Geociências
 REGEX_FILTRO = re.compile(
     r"\b("
     r"geologia|ge[oó]logo|geol[oó]gic[oa]s?|geotecnia|geot[eé]cnico|hidrogeologia|hidrogeol[oó]gico|geof[ií]sica|geof[ií]sico|"
@@ -66,7 +68,7 @@ def salvar_licitacao(id_pncp, orgao, objeto, valor, link):
 
 def enviar_alerta_telegram(mensagem):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Credenciais do Telegram ausentes. Pulando envio de mensagem.")
+        print("[!] Telegram não configurado. Pulando envio.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -78,13 +80,14 @@ def enviar_alerta_telegram(mensagem):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"[!] Erro ao enviar para o Telegram. Resposta da API: {response.text}")
+            print(f"[!] Erro na resposta do Telegram: {response.text}")
     except Exception as e:
-        print(f"[!] Falha ao disparar mensagem para o Telegram: {e}")
+        print(f"[!] Erro de conexão com o Telegram: {e}")
 
 def processar_oportunidades():
-    data_alvo = datetime.now().strftime("%Y%m%d")
-    print(f"[*] Buscando contratações ativas do PNCP até: {data_alvo}")
+    # Janela de 3 dias futuros para evitar lentidão e timeout no servidor do PNCP
+    data_futura = (datetime.now() + timedelta(days=3)).strftime("%Y%m%d")
+    print(f"[*] Buscando propostas de contratação ativas até: {data_futura}")
     endpoint = f"{API_BASE_URL}/v1/contratacoes/proposta"
     pagina = 1
     total_novos = 0
@@ -92,16 +95,32 @@ def processar_oportunidades():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://pncp.gov.br/app/editais"
     }
 
-    while True:
-        params = {"dataFinal": data_alvo, "pagina": pagina, "tamanhoPagina": 50}
-        try:
-            response = requests.get(endpoint, params=params, headers=headers, timeout=15)
-            if response.status_code == 204 or response.status_code != 200:
-                break
+    while pagina <= 3:
+        params = {"dataFinal": data_futura, "pagina": pagina, "tamanhoPagina": 30}
+        sucesso = False
+        
+        # Mecanismo de re-tentativas robusto contra lentidão no PNCP
+        for tentativa in range(3):
+            try:
+                response = requests.get(endpoint, params=params, headers=headers, timeout=40)
+                if response.status_code == 200:
+                    sucesso = True
+                    break
+                elif response.status_code == 204:
+                    break
+                else:
+                    time.sleep(3)
+            except Exception:
+                time.sleep(3)
 
+        if not sucesso:
+            break
+
+        try:
             dados = response.json()
             items = dados.get("data", [])
             if not items:
@@ -141,15 +160,14 @@ def processar_oportunidades():
                         salvar_licitacao(id_pncp, orgao, objeto, valor_estimado, link_edital)
                         total_novos += 1
                 except Exception as item_err:
-                    print(f"[!] Ignorando item inválido devido a erro de mapeamento: {item_err}")
                     continue
 
             if dados.get("paginasRestantes", 0) == 0:
                 break
             pagina += 1
-        except Exception as e:
-            print(f"[!] Erro durante execução na página {pagina}: {e}")
+        except Exception:
             break
+            
     print(f"[✓] Processamento concluído. {total_novos} novos registros encontrados.")
 
 if __name__ == '__main__':
