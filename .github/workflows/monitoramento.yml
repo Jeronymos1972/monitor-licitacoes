@@ -1,57 +1,53 @@
-
-name: Monitoramento diário de licitações
+name: Execucao Diaria do Monitor de Licitacoes
 
 on:
   schedule:
-    - cron: "0 8 * * *"
-  workflow_dispatch:
+    # Executa todos os dias às 08:00 UTC (05:00 Horário de Brasília)
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Permite execução manual
 
+# Necessário para o robô gravar o banco de dados de volta no repositório
 permissions:
-  contents: read
+  contents: write
 
+# Evita duas execuções simultâneas (e conflito no commit do banco)
 concurrency:
-  group: monitoramento-licitacoes
+  group: monitor-licitacoes
   cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 60
     steps:
-      - name: Checkout do código
-        uses: actions/checkout@v5
+    - name: Checkout do código
+      uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
+    - name: Configurar o Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: Instalar dependências
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests
+    - name: Instalar dependências
+      run: pip install requests
 
-      - name: Restaurar histórico de licitações
-        uses: actions/cache@v5
-        with:
-          path: licitacoes_geociencias.db
-          key: licitacoes-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            licitacoes-${{ github.ref_name }}-
+    - name: Executar Script de Monitoramento
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        PYTHONUNBUFFERED: '1'
+      run: python main.py
 
-      - name: Validar configuração do Telegram
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          test -n "$TELEGRAM_TOKEN" || exit 1
-          test -n "$TELEGRAM_CHAT_ID" || exit 1
-
-      - name: Executar monitoramento
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DIAS_A_FRENTE: "30"
-          LOG_LEVEL: INFO
-        run: python main.py
+    # Salva o banco no repositório para não reenviar as mesmas licitações amanhã
+    - name: Salvar banco de dados de licitações já enviadas
+      if: always()
+      run: |
+        if [ -f licitacoes_geociencias.db ]; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f licitacoes_geociencias.db
+          if ! git diff --staged --quiet; then
+            git commit -m "Atualiza banco de licitações [skip ci]"
+            git push
+          fi
+        fi
