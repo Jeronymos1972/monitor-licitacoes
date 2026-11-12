@@ -2,8 +2,9 @@ name: Execucao Diaria do Monitor de Licitacoes
 
 on:
   schedule:
+    # Executa todos os dias às 08:00 UTC (05:00 Horário de Brasília)
     - cron: '0 8 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Permite execução manual
 
 jobs:
   run-bot:
@@ -11,13 +12,16 @@ jobs:
     steps:
     - name: Checkout do código
       uses: actions/checkout@v3
+
     - name: Configurar o Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
+
     - name: Instalar dependências
       run: |
         pip install requests
+
     - name: Executar Script de Monitoramento
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
