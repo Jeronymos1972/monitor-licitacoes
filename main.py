@@ -4,6 +4,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 import requests
+from google.colab import userdata
 
 API_BASE_URL = "https://pncp.gov.br/api/consulta"
 DB_NAME = "licitacoes_geociencias.db"
@@ -13,7 +14,6 @@ MODALIDADES = {
     5: "Diálogo Competitivo", 6: "Dispensa de Licitação", 7: "Inexigibilidade"
 }
 
-# Filtro consolidado de Geociências
 REGEX_FILTRO = re.compile(
     r"\b("
     r"geologia|ge[oó]logo|geol[oó]gic[oa]s?|geotecnia|geot[eé]cnico|hidrogeologia|hidrogeol[oó]gico|geof[ií]sica|geof[ií]sico|"
@@ -29,16 +29,12 @@ REGEX_FILTRO = re.compile(
     re.IGNORECASE
 )
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    try:
-        from google.colab import userdata
-        TELEGRAM_TOKEN = userdata.get("TELEGRAM_TOKEN")
-        TELEGRAM_CHAT_ID = userdata.get("TELEGRAM_CHAT_ID")
-    except Exception:
-        pass
+try:
+    TELEGRAM_TOKEN = userdata.get("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = userdata.get("TELEGRAM_CHAT_ID")
+except:
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def inicializar_banco():
     conn = sqlite3.connect(DB_NAME)
@@ -51,125 +47,72 @@ def licitacao_ja_existe(id_pncp):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM licitacoes WHERE id_pncp = ?", (id_pncp,))
-    existe = cursor.fetchone() is not None
+    res = cursor.fetchone() is not None
     conn.close()
-    return existe
+    return res
 
 def salvar_licitacao(id_pncp, orgao, objeto, valor, link):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO licitacoes (id_pncp, orgao, objeto, valor, link, data_descoberta) VALUES (?, ?, ?, ?, ?, ?)", (id_pncp, orgao, objeto, valor, link, datetime.now().isoformat()))
+        cursor.execute("INSERT INTO licitacoes VALUES (?, ?, ?, ?, ?, ?)", (id_pncp, orgao, objeto, valor, link, datetime.now().isoformat()))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except:
         pass
     finally:
         conn.close()
 
-def enviar_alerta_telegram(mensagem):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Telegram não configurado. Pulando envio.")
-        return
+def enviar_alerta(mensagem):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": mensagem,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"[!] Erro na resposta do Telegram: {response.text}")
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": mensagem, "parse_mode": "HTML"}, timeout=15)
     except Exception as e:
-        print(f"[!] Erro de conexão com o Telegram: {e}")
+        print(f"[!] Erro envio Telegram: {e}")
 
 def processar_oportunidades():
-    # Janela de 3 dias futuros para evitar lentidão e timeout no servidor do PNCP
-    data_futura = (datetime.now() + timedelta(days=3)).strftime("%Y%m%d")
-    print(f"[*] Buscando propostas de contratação ativas até: {data_futura}")
+    inicializar_banco()
+    # Varre de 3 dias atrás até 3 dias à frente de forma leve para evitar timeouts no PNCP
+    data_inicio = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
+    data_fim = (datetime.now() + timedelta(days=3)).strftime("%Y%m%d")
+    print(f"[*] Varrendo propostas ativas no PNCP entre {data_inicio} e {data_fim}...")
+
     endpoint = f"{API_BASE_URL}/v1/contratacoes/proposta"
-    pagina = 1
-    total_novos = 0
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://pncp.gov.br/app/editais"
-    }
-
-    while pagina <= 3:
-        params = {"dataFinal": data_futura, "pagina": pagina, "tamanhoPagina": 30}
-        sucesso = False
-        
-        # Mecanismo de re-tentativas robusto contra lentidão no PNCP
+    for data_alvo in [data_inicio, data_fim]:
+        params = {"dataFinal": data_alvo, "pagina": 1, "tamanhoPagina": 50}
         for tentativa in range(3):
             try:
-                response = requests.get(endpoint, params=params, headers=headers, timeout=40)
-                if response.status_code == 200:
-                    sucesso = True
+                res = requests.get(endpoint, params=params, headers=headers, timeout=40)
+                if res.status_code == 200:
+                    itens = res.json().get("data", [])
+                    for item in itens:
+                        obj = item.get("objeto", "")
+                        if obj and REGEX_FILTRO.search(obj):
+                            cnpj = item.get('cnpjOrgao', '00000000000000')
+                            ano = item.get('anoCompra', datetime.now().year)
+                            seq = item.get('sequencialCompra', '0')
+                            id_pncp = f"{cnpj}-{ano}-{seq}"
+
+                            if licitacao_ja_existe(id_pncp):
+                                continue
+
+                            orgao = item.get("orgaoEntidade", {}).get("razaoSocial", "Órgão Não Identificado")
+                            valor = item.get("valorTotalEstimado") or 0.0
+                            link = item.get("urlItemControle") or f"https://pncp.gov.br/{cnpj}/{ano}/{seq}"
+                            mod = MODALIDADES.get(item.get("codigoModalidadeContratacao"), "Outros")
+
+                            msg = f"🚨 <b>OPORTUNIDADE GEOCIÊNCIAS!</b>\n\n🏛 <b>Órgão:</b> {orgao}\n🛠 <b>Modalidade:</b> {mod}\n💰 <b>Valor:</b> R$ {valor:,.2f}\n📝 <b>Objeto:</b>\n{obj}\n🔗 <a href='{link}'>Acesse o Edital</a>"
+                            print(f"[+] Enviando alerta Telegram: {orgao}")
+                            enviar_alerta(msg)
+                            salvar_licitacao(id_pncp, orgao, obj, valor, link)
                     break
-                elif response.status_code == 204:
+                elif res.status_code == 204:
                     break
-                else:
-                    time.sleep(3)
-            except Exception:
-                time.sleep(3)
-
-        if not sucesso:
-            break
-
-        try:
-            dados = response.json()
-            items = dados.get("data", [])
-            if not items:
-                break
-
-            for item in items:
-                if not item:
-                    continue
-                try:
-                    objeto = item.get("objeto", "")
-                    if objeto and REGEX_FILTRO.search(objeto):
-                        cnpj_orgao = item.get('cnpjOrgao') or '00000000000000'
-                        ano_compra = item.get('anoCompra') or datetime.now().year
-                        seq_compra = item.get('sequencialCompra') or '0'
-                        id_pncp = f"{cnpj_orgao}-{ano_compra}-{seq_compra}"
-
-                        if licitacao_ja_existe(id_pncp):
-                            continue
-
-                        orgao_entidade = item.get("orgaoEntidade")
-                        orgao = orgao_entidade.get("razaoSocial", "Órgão Não Identificado") if isinstance(orgao_entidade, dict) else "Órgão Não Identificado"
-
-                        valor_estimado = item.get("valorTotalEstimado") or 0.0
-                        link_edital = item.get("urlItemControle") or f"https://pncp.gov.br/{cnpj_orgao}/{ano_compra}/{seq_compra}"
-                        nome_modalidade = MODALIDADES.get(item.get("codigoModalidadeContratacao"), "Outros")
-
-                        msg_alerta = (
-                            f"🚨 <b>NOVA OPORTUNIDADE ENCONTRADA!</b>\n\n"
-                            f"🏛 <b>Órgão:</b> {orgao}\n"
-                            f"🛠 <b>Modalidade:</b> {nome_modalidade}\n"
-                            f"💰 <b>Valor Estimado:</b> R$ {valor_estimado:,.2f}\n\n"
-                            f"📝 <b>Objeto:</b>\n{objeto}\n\n"
-                            f"🔗 <a href='{link_edital}'>Clique aqui para acessar o Edital</a>"
-                        )
-                        print(f"[+] Notificando oportunidade: {id_pncp} - {orgao}")
-                        enviar_alerta_telegram(msg_alerta)
-                        salvar_licitacao(id_pncp, orgao, objeto, valor_estimado, link_edital)
-                        total_novos += 1
-                except Exception as item_err:
-                    continue
-
-            if dados.get("paginasRestantes", 0) == 0:
-                break
-            pagina += 1
-        except Exception:
-            break
-            
-    print(f"[✓] Processamento concluído. {total_novos} novos registros encontrados.")
+            except Exception as e:
+                print(f"[!] Erro tentativa {tentativa+1}: {e}")
+                time.sleep(2)
 
 if __name__ == '__main__':
-    inicializar_banco()
     processar_oportunidades()
